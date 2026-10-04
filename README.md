@@ -18,6 +18,6 @@ N-Day Nexus is a local research pipeline for comparing vulnerable and patched bu
 .venv/bin/python run.py --all
 ```
 
-The pipeline builds both images, compares symbols/disassembly, runs five isolated trials per image, and writes JSON and text reports under `reports/`. The Ghidra/Diaphora visual comparison remains a documented manual supplement. The CVE-2 files are placeholders until the primary target is validated.
+The pipeline builds both images, compares symbols/disassembly, runs five isolated trials per image, and writes JSON and text reports under `reports/`. The Ghidra/Diaphora visual comparison remains a documented manual supplement. CVE-2 compares editorconfig-core-c 0.12.5 with the upstream CVE-2023-0341 fix in 0.12.6.
 
-The target Dockerfiles pin upstream tags and enable `pwfeedback` only in the disposable vulnerable image. Docker builds require network access to fetch upstream source and Ubuntu packages.
+The target Dockerfiles pin upstream tags and enable `pwfeedback` only in the disposable vulnerable sudo image. Docker builds require network access to fetch upstream source and Ubuntu packages.

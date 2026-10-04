@@ -45,9 +45,10 @@ def diff(cve_id: str) -> dict:
             cname = f"ndaynexus-diff-{variant}"
             subprocess.run(["docker", "create", "--name", cname, image], check=True, capture_output=True)
             dest = tmp / variant
-            binary = f"{meta['binary_name']}_{variant}"
+            binary = meta.get("diff_binary_name", f"{meta['binary_name']}_{variant}")
+            source_path = meta.get("diff_binary_path", f"/usr/local/bin/{binary}")
             try:
-                subprocess.run(["docker", "cp", f"{cname}:/usr/local/bin/{binary}", str(dest)], check=True, capture_output=True)
+                subprocess.run(["docker", "cp", f"{cname}:{source_path}", str(dest)], check=True, capture_output=True)
             finally:
                 subprocess.run(["docker", "rm", cname], check=False, capture_output=True)
             binaries[variant] = _symbols(dest)
