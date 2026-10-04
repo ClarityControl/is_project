@@ -1,0 +1,24 @@
+N-DAY NEXUS REPORT
+==================
+
+1. CVE and affected program
+CVE: {{ meta.cve_id }}
+Program: {{ meta.program }}
+Affected version: {{ meta.version_vuln }} (patched: {{ meta.version_patch }})
+
+2. Bug type and vulnerable function
+{{ meta.bug_type }} in {{ meta.function }} ({{ meta.file }}).
+{{ meta.description }}
+
+3. Binary diff summary
+{{ diff.diff_summary }}
+
+4. Exploit verification
+Vulnerable crash rate: {{ results.vuln.crash_rate }} ({{ results.vuln.results | join(', ') }})
+Patched clean rate: {{ results.patched.clean_rate }} ({{ results.patched.results | join(', ') }})
+
+5. Verdict
+{{ verdict }}
+
+6. Recommended fix
+{{ meta.recommended_fix }}
