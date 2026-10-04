@@ -13,7 +13,21 @@ Affected version: {{ meta.version_vuln }} (patched: {{ meta.version_patch }})
 3. Binary diff summary
 {{ diff.diff_summary }}
 
-4. Exploit verification
+Diff artifact: {{ diff.diff_binary_path }}
+BinExport inputs: {{ diff.binexport_files | join(', ') }}
+Ghidra function evidence files: {{ diff.function_evidence_files | join(', ') }}
+Affected function analysis:
+{% for variant in ['vuln', 'patched'] %}{% set evidence = diff.function_evidence[variant] %}- {{ variant }}: {% if evidence.found %}found at {{ evidence.entry }}, stack frame {{ evidence.frame_size }} bytes, local area {{ evidence.local_size }} bytes, {{ evidence.instruction_count }} instructions{% else %}function name not recovered by Ghidra{% endif %}
+{% endfor %}The decompiled function text is in the function evidence artifacts. This static analysis does not by itself establish the overwrite offset or control-flow impact.
+Affected-function matches in BinDiff:
+{% if diff.affected_function_matches %}{% for match in diff.affected_function_matches %}- {{ match.vulnerable_name }} @ {{ match.vulnerable_address }} -> {{ match.patched_name }} @ {{ match.patched_address }}; similarity {{ match.similarity }}, confidence {{ match.confidence }}
+{% endfor %}{% else %}- The affected function name did not appear in BinDiff's matched functions; inspect the exported diff manually.
+{% endif %}Changed-function candidates (confidence at least 0.60; lower-confidence matches excluded: {{ diff.low_confidence_matches_excluded }}; human review required):
+{% if diff.changed_function_matches %}{% for match in diff.changed_function_matches[:12] %}- {{ match.vulnerable_name }} -> {{ match.patched_name }}; similarity {{ match.similarity }}, confidence {{ match.confidence }}
+{% endfor %}{% else %}- No matched functions had a lower similarity score; inspect the BinDiff database for unmatched/renamed functions.
+{% endif %}
+
+4. Probe verification (crash checks; these are not control-flow hijack demonstrations)
 Vulnerable crash rate: {{ results.vuln.crash_rate }} ({{ results.vuln.results | join(', ') }})
 Patched clean rate: {{ results.patched.clean_rate }} ({{ results.patched.results | join(', ') }})
 

@@ -1,4 +1,8 @@
 __pycache__/
 *.py[cod]
 .venv*/
+.work/
+.tools/
+nday_work/
 ndaynexus_agent_doc.pdf
+abstract_option1_ndaynexus.pdf
