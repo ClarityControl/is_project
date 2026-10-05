@@ -66,7 +66,7 @@ Build vulnerable and patched source versions
 3. **Run the probe.** `modules/runner.py` runs each target’s `exploit.py` five times per version and asks for an ASan impact result. Here “exploit” names the probe script; the project’s test goal is safe crash/memory-error reproduction, not weaponized code execution.
 4. **Compare compiled programs.** `modules/differ.py` extracts the configured binary from each image, runs Ghidra headlessly to produce BinExport and function evidence, then runs BinDiff. It records similarity/confidence and changed-function candidates.
 5. **Generate reports.** `modules/reporter.py` combines metadata and run results into `reports/<CVE-ID>.json` and `.txt`. Root-cause descriptions and patch notes originate in the target metadata; they are curated project data, not automatically discovered by the report generator.
-6. **Optionally use Ollama.** The report explanation uses saved report evidence. Blind patch analysis builds/diffs a configured target and gives Ollama source differences, BinDiff information, and selected Ghidra decompilations, without the CVE description or probe result. It can propose hypotheses but cannot verify them. A blind run still needs a configured target; a CVE identifier by itself is not enough.
+6. **Optionally use Ollama.** The report explanation uses saved report evidence. Blind patch analysis gives Ollama source differences, BinDiff information, and selected Ghidra decompilations, without the CVE description or probe result. Prepared reverse-engineering evidence is reused by image ID on repeat runs; select the dashboard rebuild option after changing the target source/build. The model receives a bounded prompt and answer length to keep local inference responsive. It can propose hypotheses but cannot verify them. A blind run still needs a configured target; a CVE identifier by itself is not enough.
 7. **View results.** `ui.py` provides a small Streamlit dashboard. Its Patch tab shows changed-line counts, a highlighted source diff, version/commit provenance, build instrumentation notes, and available BinDiff candidates. The **Control-flow lab** tab runs a separate synthetic case with vulnerable and patched builds: one redirects a callback to a harmless `hello_world` function, and the other rejects the input. This is a demonstration of the concept, not evidence about a real CVE. The detailed outputs remain in `reports/` and `.work/artifacts/`.
 
 The report’s `CONFIRMED` label is the program’s threshold-based verdict: the vulnerable build crashed in at least 80% of trials and the patched build in at most 20%. ASan evidence is recorded separately. Interpret that label as a reproducible difference in this configured experiment, **not** as proof of remote reachability, privilege escalation, or arbitrary code execution.
@@ -131,20 +131,21 @@ The first explains evidence in a saved report. The second creates a blind patch 
 
 ## 8. Suggested team contributions
 
-Divide ownership across three people while keeping the workload and presentation contribution balanced. Each member should understand the overall workflow and review the final claims.
+Use one case study and one technical workstream per member. This gives everyone a concrete result to own while splitting the engineering work across the source/evidence, runtime, and binary/UI layers. The assignments below are suggestions; team members can swap CVEs while retaining the same-sized work packages.
 
-| Team member | Main ownership | Concrete contributions and deliverables |
-|---|---|---|
-| **Member 1 — CVE research and validation** | The vulnerability cases and their evidence. | Verify the vulnerable/fixed versions against upstream references; explain each root cause and patch; maintain target metadata and safe probes with Member 2; interpret the crash and ASan results; prepare the vulnerability background and case-study slides. |
-| **Member 2 — Builds and reverse engineering** | Reproducible target builds and binary comparison. | Maintain the vulnerable/patched Dockerfiles; build the isolated images; extract target binaries; run Ghidra, BinExport, and BinDiff; review changed-function candidates with Member 1; document build requirements, binary evidence, and tool limitations. |
-| **Member 3 — Pipeline, Ollama, and presentation** | Running the stages together and making results usable. | Maintain the CLI, report generation, Streamlit dashboard, and Ollama explanation/blind-analysis flow; check that reports link back to evidence; write setup/run instructions; prepare the workflow diagram and demo; coordinate the final review and viva preparation. |
+| Team member | Case study | Technical workstream and deliverables | Presentation contribution |
+|---|---|---|---|
+| **Member 1 — Source evidence and Ollama** | CVE-2019-18634 (sudo): verify conditions, pinned versions, source location, patch, and the advisory-versus-build storage classification. | Maintain source-patch extraction and root-cause evidence in reports; improve the Ollama prompt/evidence handling and check that hypotheses cite available artifacts. Deliver one reviewed case note and one tested source/LLM change. | Explain the Sudo case, source patch, and how to interpret an Ollama hypothesis. |
+| **Member 2 — Isolated runtime validation** | CVE-2023-0341 (EditorConfig): verify the affected/fixed versions and expected safe probe behavior. | Maintain Docker build definitions, controlled probes, and ASan impact checks; document reproducible build/run steps and interpret the vulnerable-versus-patched outcomes. Deliver one reviewed case note and one validated runtime/build improvement. | Demonstrate the paired builds and explain what the probe and ASan results establish. |
+| **Member 3 — Binary analysis and dashboard** | CVE-2021-3177 (CPython): verify the version pair and regression input, then summarize its observed results. | Maintain Ghidra/BinExport/BinDiff analysis and the dashboard’s result views; explain changed-function candidates and their limits. Deliver one reviewed case note and one tested binary-analysis/dashboard improvement. | Show a changed-function result in the dashboard and explain similarity, confidence, and limitations. |
 
 ### Shared responsibilities
 
-- Each member reviews one other member’s work before the final demonstration.
-- All three should be able to explain the project workflow, what the `CONFIRMED` verdict means, and why it does not prove code execution.
-- Present together: Member 1 introduces CVEs and the three cases; Member 2 demonstrates the paired builds and Ghidra/BinDiff evidence; Member 3 walks through reports, the dashboard, and Ollama. Everyone answers questions about limitations and methodology.
-- Keep a short contribution log showing who completed each deliverable. Swap tasks if someone is blocked, while preserving these three areas of ownership.
+- Each member should complete the same three visible outputs: a case note with sources, a code or analysis deliverable, and a short demonstration segment. Keep a contribution log with links to commits, reports, or artifacts so the split is easy to substantiate.
+- Review in a cycle: Member 1 reviews Member 2’s case and code, Member 2 reviews Member 3’s, and Member 3 reviews Member 1’s. The author addresses review notes before the presentation.
+- All three should be able to explain the complete workflow, the meaning of the `CONFIRMED` verdict, why it does not prove code execution, and how the synthetic control-flow lab differs from evidence about real CVEs.
+- Present each case with its owner, then have each member present their technical workstream. Everyone should be ready to answer questions about the full project and its limitations.
+- If someone’s assigned component takes substantially longer, rebalance implementation tasks rather than leaving one person with integration or presentation work alone. Agree on the swap and record it in the contribution log.
 
 ## 9. Possible viva questions
 

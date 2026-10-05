@@ -218,35 +218,84 @@ with ollama:
         explain_clicked = explain_col.button(
             "Explain report", disabled=not load_report(cve_id), key=f"explain_{cve_id}")
         blind_clicked = blind_col.button("Blind patch analysis", key=f"blind_{cve_id}")
+        refresh_evidence = st.checkbox(
+            "Rebuild images and rerun Ghidra/BinDiff before blind analysis",
+            key=f"blind_refresh_{cve_id}",
+            help="Leave unchecked to reuse prepared evidence. Turn this on after changing target source or build settings.",
+        )
 
         if explain_clicked or blind_clicked:
-            action = explain_with_ollama if explain_clicked else blind_analyze
-            label = "Generating explanation…" if explain_clicked else "Building and analyzing patch…"
-            with st.spinner(label):
+            st.session_state.pop(f"ollama_error_{cve_id}", None)
+            st.session_state.pop(f"ollama_result_{cve_id}", None)
+            st.session_state.pop(f"ollama_mode_{cve_id}", None)
+            if explain_clicked:
+                label = "Generating a concise explanation…"
+                progress_area = st.status(label, expanded=True)
                 try:
-                    generated = action(cve_id, model)
-                    st.session_state[f"ollama_result_{cve_id}"] = generated.get(
-                        "text", generated.get("hypothesis_text", ""))
+                    generated = explain_with_ollama(cve_id, model)
+                    progress_area.update(label="Explanation complete", state="complete", expanded=False)
+                    st.session_state[f"ollama_result_{cve_id}"] = generated.get("text", "")
                     st.session_state[f"ollama_label_{cve_id}"] = generated.get("label", "Model hypothesis")
-                    st.session_state[f"ollama_mode_{cve_id}"] = "blind" if blind_clicked else "report"
+                    st.session_state[f"ollama_mode_{cve_id}"] = "report"
+                    st.session_state[f"ollama_seconds_{cve_id}"] = generated.get("generation_seconds")
                 except (RuntimeError, OSError) as exc:
-                    st.error(str(exc))
+                    progress_area.update(label="Explanation failed", state="error", expanded=True)
+                    st.session_state[f"ollama_error_{cve_id}"] = str(exc)
+            else:
+                progress_area = st.status("Preparing blind-analysis evidence…", expanded=True)
+
+                def update_blind_progress(message):
+                    progress_area.update(label=message, state="running", expanded=True)
+
+                try:
+                    generated = blind_analyze(
+                        cve_id, model, refresh_evidence=refresh_evidence,
+                        progress=update_blind_progress,
+                    )
+                    progress_area.update(label="Blind analysis complete", state="complete", expanded=False)
+                    st.session_state[f"ollama_result_{cve_id}"] = generated.get("hypothesis_text", "")
+                    st.session_state[f"ollama_label_{cve_id}"] = generated.get("label", "Model hypothesis")
+                    st.session_state[f"ollama_mode_{cve_id}"] = "blind"
+                    st.session_state[f"ollama_seconds_{cve_id}"] = generated.get("generation_seconds")
+                    st.session_state[f"ollama_cache_hit_{cve_id}"] = generated.get("evidence_cache_reused", False)
+                    st.session_state[f"ollama_preparation_seconds_{cve_id}"] = generated.get("preparation_seconds")
+                except (RuntimeError, OSError) as exc:
+                    progress_area.update(label="Blind analysis failed", state="error", expanded=True)
+                    st.session_state[f"ollama_error_{cve_id}"] = str(exc)
+
+    if st.session_state.get(f"ollama_error_{cve_id}"):
+        st.error(st.session_state[f"ollama_error_{cve_id}"])
 
     saved_text = st.session_state.get(f"ollama_result_{cve_id}")
     saved_label = st.session_state.get(f"ollama_label_{cve_id}", "Model hypothesis")
-    if not saved_text:
+    if not saved_text and not st.session_state.get(f"ollama_error_{cve_id}"):
         saved = report.get("llm_explanation", {})
         saved_text = saved.get("text", "")
         saved_label = saved.get("label", saved_label)
-    blind_path = ROOT / ".work" / "artifacts" / cve_id / "blind_hypothesis.md"
+    blind_path = ROOT / ".work" / "artifacts" / cve_id / "blind_hypothesis.json"
     if st.session_state.get(f"ollama_mode_{cve_id}") == "blind" and blind_path.is_file():
-        saved_text = blind_path.read_text().split("\n\n", 3)[-1]
+        try:
+            blind_saved = json.loads(blind_path.read_text())
+            saved_text = blind_saved.get("hypothesis_text", "")
+        except (OSError, json.JSONDecodeError):
+            saved_text = ""
         saved_label = "Blind patch analysis · hypothesis"
     if saved_text:
         st.caption(saved_label)
+        duration = st.session_state.get(f"ollama_seconds_{cve_id}")
+        if duration is not None:
+            prep = st.session_state.get(f"ollama_preparation_seconds_{cve_id}")
+            timing = f"Model generation: {duration}s"
+            if prep is not None:
+                timing = f"Evidence preparation: {prep}s · {timing}"
+            if st.session_state.get(f"ollama_cache_hit_{cve_id}"):
+                timing += " · reused Ghidra/BinDiff evidence"
+            st.caption(timing)
         st.markdown(saved_text)
-    else:
+    elif not st.session_state.get(f"ollama_error_{cve_id}"):
         st.caption("Choose a mode above. Blind analysis can run without a saved report.")
+    else:
+        st.warning("No hypothesis text was received. The error above explains why; you can retry with a shorter prompt or another local model.")
 
 with reports:
     json_path = REPORTS / f"{cve_id}.json"

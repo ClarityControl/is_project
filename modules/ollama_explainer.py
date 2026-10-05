@@ -1,8 +1,11 @@
 """Generate evidence-linked, clearly labeled explanations with local Ollama."""
 import json
+import hashlib
 import os
 import difflib
+import time
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -31,7 +34,12 @@ def _request(path: str, payload: dict | None = None, timeout: int = 2) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1000).decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama returned HTTP {exc.code} for {path}: {detail or exc.reason}") from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        if isinstance(exc, TimeoutError):
+            raise RuntimeError(f"Ollama did not respond within {timeout} seconds. The model may still be loading or generating; try a smaller model or shorter prompt.") from exc
         raise RuntimeError(
             f"Could not reach Ollama at {_base_url()}. Start the local Ollama service and confirm a model is installed. ({exc})"
         ) from exc
@@ -43,19 +51,19 @@ def list_models() -> list[str]:
     return sorted({item.get("name") for item in response.get("models", []) if item.get("name")})
 
 
-def _read_function_evidence(cve_id: str, variant: str) -> str:
+def _read_function_evidence(cve_id: str, variant: str, limit: int = 6000) -> str:
     path = ARTIFACTS / cve_id / f"{variant}_function.json"
     try:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return ""
     decompiled = value.get("decompiled", "")
-    if len(decompiled) > 12000:
-        decompiled = decompiled[:12000] + "\n[truncated]"
+    if len(decompiled) > limit:
+        decompiled = decompiled[:limit] + "\n[truncated]"
     return decompiled
 
 
-def _read_changed_function_evidence(cve_id: str, variant: str, limit: int = 6) -> list[dict]:
+def _read_changed_function_evidence(cve_id: str, variant: str, limit: int = 2) -> list[dict]:
     path = ARTIFACTS / cve_id / f"{variant}_changed_functions.json"
     try:
         functions = json.loads(path.read_text()).get("functions", [])
@@ -63,7 +71,7 @@ def _read_changed_function_evidence(cve_id: str, variant: str, limit: int = 6) -
         return []
     return [
         {"name": item.get("name", "unknown"), "entry": item.get("entry", ""),
-         "decompiled": item.get("decompiled", "")[:2500]}
+         "decompiled": item.get("decompiled", "")[:1400]}
         for item in functions[:limit]
     ]
 
@@ -175,23 +183,31 @@ def explain(cve_id: str, model: str) -> dict:
 Write a clear, useful explanation in natural prose or Markdown. Explain your hypothesis about the root cause, how the patch changes the behavior, what the runtime evidence demonstrates, and what remains uncertain. Cite supplied evidence IDs in square brackets where useful, such as [SOURCE_PATCH_DIFF] or [ASAN_VULNERABLE]. Use headings or bullets only if they help readability. Do not return JSON or follow a rigid schema. Do not invent source lines, function changes, test results, or facts.
 
 INPUT EVIDENCE:\n""" + json.dumps(context, ensure_ascii=False)
+    started = time.monotonic()
     response = _request(
         "/api/chat",
         {
             "model": model,
             "stream": False,
+            "think": False,
+            "keep_alive": "10m",
             "messages": [{"role": "user", "content": prompt}],
-            "options": {"temperature": 0.1, "num_ctx": 16384},
+            "options": {"temperature": 0.1, "num_ctx": 8192, "num_predict": 650},
         },
-        timeout=300,
+        timeout=600,
     )
-    content = response.get("message", {}).get("content", "")
+    message = response.get("message", {})
+    content = message.get("content", "")
     if not content.strip():
-        raise RuntimeError("Ollama returned an empty explanation.")
+        reason = "Ollama returned no final explanation text."
+        if message.get("thinking"):
+            reason += " The model produced thinking output only; disable thinking for this model or choose a non-thinking model."
+        raise RuntimeError(reason)
     generated = {
         "text": content.strip(),
         "model": model,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generation_seconds": round(time.monotonic() - started, 1),
         "label": "Model-generated hypothesis; review against primary evidence.",
         "evidence_sources": [item["id"] for item in evidence],
     }
@@ -204,7 +220,114 @@ INPUT EVIDENCE:\n""" + json.dumps(context, ensure_ascii=False)
     return generated
 
 
-def blind_analyze(cve_id: str, model: str) -> dict:
+def _docker_image_ids(cve_id: str) -> dict[str, str] | None:
+    ids = {}
+    for variant in ("vuln", "patched"):
+        tag = f"ndaynexus-{cve_id.lower()}-{variant}"
+        try:
+            result = subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+                check=True, capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        ids[variant] = result.stdout.strip()
+    return ids
+
+
+def _required_blind_artifacts(cve_id: str) -> list[Path]:
+    artifact_dir = ARTIFACTS / cve_id
+    return [artifact_dir / name for name in (
+        "vuln.elf", "patched.elf", "vuln.BinExport", "patched.BinExport",
+        "vuln_function.json", "patched_function.json", "vuln_changed_functions.json",
+        "patched_changed_functions.json", "source_patch.diff",
+    )]
+
+
+def _legacy_artifacts_match_images(cve_id: str, meta: dict, artifact_dir: Path) -> bool:
+    """Adopt earlier evidence only when its extracted binaries match current images."""
+    binary_paths = meta.get("diff_binary_paths", {})
+    for variant in ("vuln", "patched"):
+        image = f"ndaynexus-{cve_id.lower()}-{variant}"
+        source = (binary_paths.get(variant) or meta.get("diff_binary_path")
+                  or f"/usr/local/bin/{meta['binary_name']}_{variant}")
+        container = f"ndaynexus-cache-check-{variant}-{os.getpid()}"
+        try:
+            subprocess.run(["docker", "create", "--name", container, image],
+                           check=True, capture_output=True, text=True, timeout=30)
+            with tempfile.TemporaryDirectory(prefix="ndaynexus-cache-") as temp_dir:
+                extracted = Path(temp_dir) / f"{variant}.elf"
+                subprocess.run(["docker", "cp", f"{container}:{source}", str(extracted)],
+                               check=True, capture_output=True, text=True, timeout=30)
+                old = (artifact_dir / f"{variant}.elf").read_bytes()
+                current = extracted.read_bytes()
+                if hashlib.sha256(old).digest() != hashlib.sha256(current).digest():
+                    return False
+        except (OSError, subprocess.SubprocessError, KeyError):
+            return False
+        finally:
+            subprocess.run(["docker", "rm", "-f", container], check=False,
+                           capture_output=True, text=True, timeout=30)
+    return True
+
+
+def _legacy_diff_data(cve_id: str, meta: dict, artifact_dir: Path) -> dict | None:
+    report_path = REPORTS / f"{cve_id}.json"
+    try:
+        report_diff = json.loads(report_path.read_text()).get("diff", {})
+        if report_diff.get("changed_function_matches") is not None:
+            data = report_diff
+        else:
+            db_path = artifact_dir / "vuln_vs_patched.BinDiff"
+            if not db_path.is_file():
+                return None
+            from modules.differ import _read_bindiff
+            raw = _read_bindiff(db_path, meta.get("function", ""))
+            candidates = raw.pop("changed_candidates", [])
+            reviewed = [item for item in candidates if item["confidence"] >= 0.60
+                        and item["vulnerable_name"] and item["patched_name"]]
+            data = {**raw, "changed_function_matches": reviewed[:100],
+                    "changed_functions": sorted({name for item in reviewed for name in
+                                                  (item["vulnerable_name"], item["patched_name"])}),
+                    "changed_match_count": len(candidates)}
+        data = dict(data)
+        data["candidate_function_evidence_files"] = [
+            str((artifact_dir / f"{variant}_changed_functions.json").relative_to(ROOT))
+            for variant in ("vuln", "patched")
+        ]
+        return data
+    except (OSError, KeyError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _cached_blind_diff(cve_id: str, meta: dict, image_ids: dict[str, str]) -> dict | None:
+    artifact_dir = ARTIFACTS / cve_id
+    cache_path = artifact_dir / "blind_evidence_cache.json"
+    required = _required_blind_artifacts(cve_id)
+    if not all(path.is_file() and path.stat().st_size for path in required):
+        return None
+    try:
+        cache = json.loads(cache_path.read_text())
+        if cache.get("image_ids") == image_ids:
+            return cache["diff"]
+    except (OSError, KeyError, json.JSONDecodeError):
+        pass
+    # Upgrade prior runs without rerunning Ghidra, but only when the saved ELFs
+    # byte-match the binaries inside today's Docker images.
+    if _legacy_artifacts_match_images(cve_id, meta, artifact_dir):
+        data = _legacy_diff_data(cve_id, meta, artifact_dir)
+        if data:
+            cache_path.write_text(json.dumps({
+                "image_ids": image_ids,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "diff": data,
+            }, indent=2) + "\n")
+            return data
+    return None
+
+
+def blind_analyze(cve_id: str, model: str, *, refresh_evidence: bool = False,
+                  progress=None) -> dict:
     """Build/diff a configured target and request a hypothesis without probe reports."""
     target_dir = ROOT / "targets" / cve_id
     meta_path = target_dir / "meta.json"
@@ -214,13 +337,33 @@ def blind_analyze(cve_id: str, model: str) -> dict:
 
     from modules.builder import build
     from modules.differ import diff
-    try:
-        build(cve_id)
-        diff_data = diff(cve_id, include_candidate_decomp=True)
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        raise RuntimeError(f"Could not prepare blind-analysis evidence for {cve_id}: {exc}") from exc
+    preparation_started = time.monotonic()
+    image_ids = _docker_image_ids(cve_id)
+    diff_data = None if refresh_evidence or not image_ids else _cached_blind_diff(cve_id, meta, image_ids)
+    evidence_cache_reused = diff_data is not None
+    if diff_data is None:
+        try:
+            if progress:
+                progress("Building vulnerable and patched images…")
+            build(cve_id)
+            if progress:
+                progress("Running Ghidra and BinDiff (this is the slow preparation step)…")
+            diff_data = diff(cve_id, include_candidate_decomp=True)
+            image_ids = _docker_image_ids(cve_id)
+            if image_ids:
+                cache_path = ARTIFACTS / cve_id / "blind_evidence_cache.json"
+                cache_path.write_text(json.dumps({
+                    "image_ids": image_ids,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "diff": diff_data,
+                }, indent=2) + "\n")
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"Could not prepare blind-analysis evidence for {cve_id}: {exc}") from exc
+    elif progress:
+        progress("Reusing cached build and Ghidra/BinDiff evidence…")
     source_patch = _extract_source_patch(cve_id, meta)
-    candidates = diff_data.get("changed_function_matches", [])[:6]
+    preparation_seconds = round(time.monotonic() - preparation_started, 1)
+    candidates = diff_data.get("changed_function_matches", [])[:4]
     input_evidence = {
         "vulnerable_to_patched_source_diff": source_patch,
         "binary_diff_overview": {
@@ -243,20 +386,36 @@ def blind_analyze(cve_id: str, model: str) -> dict:
 Write a flexible plain-language hypothesis in Markdown or prose. Identify one or more plausible vulnerability classes, explain which changed behavior suggests them, point to relevant function names and exact source snippets when possible, and give a confidence level with reasons. Distinguish evidence from speculation. State what additional safe tests or source review would be needed to confirm or reject the hypotheses. Do not claim a vulnerability is confirmed or infer exploitability from a patch alone. Do not return JSON or follow a rigid schema.
 
 BLIND ANALYSIS INPUT:\n""" + json.dumps(input_evidence, ensure_ascii=False)
+    # Bound prompt size so small local models spend less time on prefill.
+    encoded_evidence = json.dumps(input_evidence, ensure_ascii=False)
+    if len(encoded_evidence) > 22000:
+        input_evidence["vulnerable_to_patched_source_diff"] = source_patch[:9000] + "\n[diff excerpted for model context]"
+        encoded_evidence = json.dumps(input_evidence, ensure_ascii=False)
+    prompt = prompt.split("BLIND ANALYSIS INPUT:\n", 1)[0] + "BLIND ANALYSIS INPUT:\n" + encoded_evidence
+    if progress:
+        progress("Asking Ollama for a concise hypothesis…")
+    started = time.monotonic()
     response = _request(
         "/api/chat",
-        {"model": model, "stream": False,
+        {"model": model, "stream": False, "think": False, "keep_alive": "10m",
          "messages": [{"role": "user", "content": prompt}],
-         "options": {"temperature": 0.15, "num_ctx": 16384}},
-        timeout=300,
+         "options": {"temperature": 0.15, "num_ctx": 8192, "num_predict": 650}},
+        timeout=600,
     )
-    text = response.get("message", {}).get("content", "").strip()
+    message = response.get("message", {})
+    text = message.get("content", "").strip()
     if not text:
-        raise RuntimeError("Ollama returned an empty blind-analysis hypothesis.")
+        reason = "Ollama returned no final answer text."
+        if message.get("thinking"):
+            reason += " The model produced thinking output only; disable thinking for this model or choose a non-thinking model."
+        raise RuntimeError(reason)
     result = {
         "mode": "blind_patch_analysis",
         "model": model,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generation_seconds": round(time.monotonic() - started, 1),
+        "preparation_seconds": preparation_seconds,
+        "evidence_cache_reused": evidence_cache_reused,
         "label": "Unverified model hypothesis. It was generated without the CVE description or runtime probe results.",
         "evidence_sources": ["vulnerable_to_patched_source_diff", "BinDiff", "Ghidra"],
         "hypothesis_text": text,

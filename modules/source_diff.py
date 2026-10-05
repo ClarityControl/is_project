@@ -1,9 +1,9 @@
 """Extract and summarize the configured vulnerable-to-patched source change."""
 import difflib
 import json
-import os
 import re
 import subprocess
+import uuid
 from pathlib import Path
 
 
@@ -45,20 +45,31 @@ def get_source_comparison(cve_id: str) -> dict:
     source_lines = {}
     for variant in ("vuln", "patched"):
         image = f"ndaynexus-{cve_id.lower()}-{variant}"
-        container = f"ndaynexus-source-{variant}-{os.getpid()}"
+        container = f"ndaynexus-source-{variant}-{uuid.uuid4().hex[:12]}"
         destination = artifact_dir / f"{variant}_{source_path.name}.source"
         try:
             subprocess.run(["docker", "create", "--name", container, image], check=True,
                            capture_output=True, text=True, timeout=30)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(
+                f"Docker could not create a temporary container from image {image}: {detail}"
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Docker create failed for image {image}: {exc}") from exc
+        try:
             subprocess.run(["docker", "cp", f"{container}:/build/{source_path.as_posix()}",
                             str(destination)], check=True, capture_output=True, text=True,
                            timeout=30)
             source_lines[variant] = destination.read_text(errors="replace").splitlines(keepends=True)
-        except (OSError, subprocess.SubprocessError) as exc:
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(
-                f"Could not read {relative_path} from the {variant} image. "
-                f"Build both images first with the dashboard's full pipeline action. ({exc})"
+                f"Docker created the {variant} container, but could not copy /build/{source_path.as_posix()} "
+                f"from image {image}: {detail}"
             ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Could not extract {relative_path} from {image}: {exc}") from exc
         finally:
             try:
                 subprocess.run(["docker", "rm", "-f", container], check=False,
