@@ -14,7 +14,8 @@ Source-level root-cause evidence:
 - Location: {{ meta.root_cause.source_location }}
 - Vulnerable behavior: {{ meta.root_cause.vulnerable_operation }}
 - Patch behavior: {{ meta.root_cause.patch_change }}
-- Upstream version diff: {{ meta.root_cause.source_diff }}
+{% if meta.root_cause.target_build_buffer_storage is defined %}- Classification note: advisory says {{ meta.root_cause.advisory_classification }}; {{ meta.root_cause.target_build_buffer_storage }} The ASan report labels the observed write {{ meta.root_cause.sanitizer_observed_classification }}.
+{% endif %}- Upstream version diff: {{ meta.root_cause.source_diff }}
 
 3. Binary diff summary
 {{ diff.diff_summary }}

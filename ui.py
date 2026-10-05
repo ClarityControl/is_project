@@ -9,6 +9,7 @@ import streamlit as st
 
 from modules.ollama_explainer import blind_analyze, explain as explain_with_ollama, list_models
 from modules.builder import build
+from modules.control_flow_demo import run_control_flow_demo
 from modules.source_diff import get_source_comparison
 
 
@@ -77,7 +78,9 @@ st.subheader(f"{meta.get('program', cve_id)} · {cve_id}")
 version = f"{meta.get('version_vuln', '?')} → {meta.get('version_patch', '?')}"
 st.caption(f"{version} · {meta.get('bug_type', 'Vulnerability type not recorded')}")
 
-summary, patch_tab, ollama, reports = st.tabs(["Overview", "Patch", "Ollama", "Reports"])
+summary, patch_tab, control_flow, ollama, reports = st.tabs(
+    ["Overview", "Patch", "Control-flow lab", "Ollama", "Reports"]
+)
 
 with summary:
     results = report.get("results", {})
@@ -163,6 +166,44 @@ with patch_tab:
             ], hide_index=True, use_container_width=True)
     if not comparison:
         st.caption("Load the comparison to see changed-line counts and the highlighted source diff.")
+
+with control_flow:
+    st.markdown("**Synthetic lab · benign callback redirect**")
+    st.caption(
+        "This self-contained teaching case deliberately places a function pointer after a fixed-size buffer. "
+        "It is separate from the selected CVE and does not demonstrate exploitability of a real CVE."
+    )
+    if st.button("Run benign redirect demo", type="primary", key="run_control_flow_demo"):
+        with st.spinner("Building isolated lab images and comparing both outcomes…"):
+            try:
+                st.session_state["control_flow_demo_result"] = run_control_flow_demo()
+                st.session_state.pop("control_flow_demo_error", None)
+            except (RuntimeError, OSError, ValueError) as exc:
+                st.session_state["control_flow_demo_error"] = str(exc)
+
+    if st.session_state.get("control_flow_demo_error"):
+        st.error(st.session_state["control_flow_demo_error"])
+    demo_result = st.session_state.get("control_flow_demo_result")
+    if demo_result:
+        vuln_col, patch_col = st.columns(2)
+        vuln_col.metric("Vulnerable lab", "Redirected" if demo_result["vulnerable"]["redirected"] else "No redirect")
+        patch_col.metric("Patched lab", "Rejected" if demo_result["patched"]["rejected"] else "Not rejected")
+        st.code(demo_result["vulnerable"]["output"], language="text")
+        with st.expander("Patched build output"):
+            st.code(demo_result["patched"]["output"], language="text")
+        st.caption(
+            f"Payload: {demo_result['payload_bytes']} bytes · callback offset: "
+            f"{demo_result['callback_offset']} · target: {demo_result['benign_target']} · "
+            "No shell or external command is invoked."
+        )
+        artifact = ROOT / ".work" / "artifacts" / "LAB-CFH-001" / "control_flow_demo.json"
+        if artifact.is_file():
+            st.download_button("Download demo evidence", artifact.read_bytes(),
+                               file_name="LAB-CFH-001-control-flow-demo.json",
+                               mime="application/json")
+        with st.expander("What this demonstrates"):
+            st.write("The vulnerable build lets input overwrite a callback pointer, then dispatches to a fixed function that prints HELLO WORLD. The patched build checks input length and rejects the same bytes.")
+            st.caption("This confirms the mechanics in this synthetic program only. Real CVE targets need their own safe, case-specific evidence.")
 
 with ollama:
     try:
