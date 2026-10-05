@@ -10,13 +10,19 @@ Affected version: {{ meta.version_vuln }} (patched: {{ meta.version_patch }})
 {{ meta.bug_type }} in {{ meta.function }} ({{ meta.file }}).
 {{ meta.description }}
 
+Source-level root-cause evidence:
+- Location: {{ meta.root_cause.source_location }}
+- Vulnerable behavior: {{ meta.root_cause.vulnerable_operation }}
+- Patch behavior: {{ meta.root_cause.patch_change }}
+- Upstream version diff: {{ meta.root_cause.source_diff }}
+
 3. Binary diff summary
 {{ diff.diff_summary }}
 
 Diff artifact: {{ diff.diff_binary_path }}
 BinExport inputs: {{ diff.binexport_files | join(', ') }}
 Ghidra function evidence files: {{ diff.function_evidence_files | join(', ') }}
-Affected function analysis:
+Ghidra function metrics (these frame sizes do not identify the vulnerable buffer's storage location):
 {% for variant in ['vuln', 'patched'] %}{% set evidence = diff.function_evidence[variant] %}- {{ variant }}: {% if evidence.found %}found at {{ evidence.entry }}, stack frame {{ evidence.frame_size }} bytes, local area {{ evidence.local_size }} bytes, {{ evidence.instruction_count }} instructions{% else %}function name not recovered by Ghidra{% endif %}
 {% endfor %}The decompiled function text is in the function evidence artifacts. This static analysis does not by itself establish the overwrite offset or control-flow impact.
 Affected-function matches in BinDiff:
@@ -27,12 +33,34 @@ Affected-function matches in BinDiff:
 {% endfor %}{% else %}- No matched functions had a lower similarity score; inspect the BinDiff database for unmatched/renamed functions.
 {% endif %}
 
-4. Probe verification (crash checks; these are not control-flow hijack demonstrations)
+4. Probe verification (local container runtime evidence; not a control-flow hijack demonstration)
 Vulnerable crash rate: {{ results.vuln.crash_rate }} ({{ results.vuln.results | join(', ') }})
 Patched clean rate: {{ results.patched.clean_rate }} ({{ results.patched.results | join(', ') }})
+{% for variant in ['vuln', 'patched'] %}{{ variant | capitalize }} probe observations:
+{% if results[variant].trials is defined %}{% for trial in results[variant].trials %}- {{ trial.outcome }}; payload {{ trial.payload_bytes | default('unknown') }} bytes{% if trial.signal is defined and trial.signal %}; terminating signal {{ trial.signal }} (process exit {{ trial.exit_code }}){% elif trial.exit_code is defined %}; process exit {{ trial.exit_code }}{% endif %}
+{% endfor %}{% else %}- Per-trial process telemetry is not present in this report; rerun the probe stage to collect it.
+{% endif %}{% endfor %}
 
-5. Verdict
+AddressSanitizer impact validation:
+{% for variant in ['vuln', 'patched'] %}- {{ variant }}: {{ results[variant].impact.outcome | default('NOT RUN') }}{% if results[variant].impact.diagnostic is defined %}; {{ results[variant].impact.diagnostic }}{% endif %}{% if results[variant].impact.error is defined %}; {{ results[variant].impact.error }}{% endif %}
+{% for line in results[variant].impact.evidence_excerpt | default([]) %}  {{ line }}
+{% endfor %}
+{% endfor %}
+
+{% if llm_explanation %}5. Model-generated explanation (hypothesis; human review required)
+Model: {{ llm_explanation.model }} · generated {{ llm_explanation.generated_at }}
+{{ llm_explanation.label }}
+
+{% if llm_explanation.text %}{{ llm_explanation.text }}{% else %}{{ llm_explanation.summary | default('') }}
+{{ llm_explanation.suspected_root_cause | default('') }}
+{{ llm_explanation.patch_effect | default('') }}
+{{ llm_explanation.impact | default('') }}{% endif %}
+
+Evidence supplied to the model: {{ llm_explanation.evidence_sources | default([]) | join(', ') }}
+{% endif %}
+
+{% if llm_explanation %}6{% else %}5{% endif %}. Verdict
 {{ verdict }}
 
-6. Recommended fix
+{% if llm_explanation %}7{% else %}6{% endif %}. Recommended fix
 {{ meta.recommended_fix }}

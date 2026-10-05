@@ -8,6 +8,7 @@ from modules.builder import build
 from modules.differ import diff
 from modules.runner import run as run_exploit
 from modules.reporter import report
+from modules.ollama_explainer import blind_analyze, explain as explain_with_ollama, list_models
 
 ROOT = Path(__file__).resolve().parent
 
@@ -18,7 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description="Compare and validate local historical CVE builds")
     parser.add_argument("cve_id", nargs="?", help="CVE identifier, or use --all")
     parser.add_argument("--all", action="store_true", help="run every configured target")
-    parser.add_argument("--step", choices=("build", "diff", "probe", "exploit", "report"), help="run one pipeline step")
+    parser.add_argument("--step", choices=("build", "diff", "probe", "exploit", "report", "explain", "blind"), help="run one pipeline step")
+    parser.add_argument("--model", help="Ollama model name for an explanation step; defaults to the first installed model")
     args = parser.parse_args()
     ids = target_ids() if args.all else ([args.cve_id] if args.cve_id else [])
     if not ids or (args.all and args.cve_id):
@@ -27,6 +29,31 @@ def main():
         if cve_id not in target_ids():
             parser.error(f"unknown CVE: {cve_id}")
         print(f"[N-DAY NEXUS] {cve_id}\n{'─' * 41}")
+        if args.step in ("explain", "blind"):
+            model = args.model
+            if not model:
+                try:
+                    models = list_models()
+                except RuntimeError as exc:
+                    parser.error(str(exc))
+                if not models:
+                    parser.error("No Ollama models found. Pull a local model or pass --model.")
+                model = models[0]
+            try:
+                generated = (blind_analyze(cve_id, model) if args.step == "blind"
+                             else explain_with_ollama(cve_id, model))
+            except RuntimeError as exc:
+                parser.error(str(exc))
+            print(f"[OLLAMA] {'Blind hypothesis' if args.step == 'blind' else 'Draft explanation'} generated with {model}")
+            preview = generated.get("hypothesis_text", generated.get("text", "")).replace("\n", " ").strip()
+            print(f"[OLLAMA] {preview[:300]}")
+            if args.step == "blind":
+                print(f"[ARTIFACT] .work/artifacts/{cve_id}/blind_hypothesis.md")
+                print(f"[ARTIFACT] .work/artifacts/{cve_id}/blind_hypothesis.json")
+            else:
+                print(f"[REPORT] reports/{cve_id}.json")
+                print(f"[REPORT] reports/{cve_id}.txt")
+            continue
         diff_data = None
         results = None
         built = None
@@ -50,6 +77,13 @@ def main():
         if args.step == "diff":
             continue
         if args.step in ("probe", "exploit"):
+            prior = ROOT / "reports" / f"{cve_id}.json"
+            if prior.exists():
+                old = json.loads(prior.read_text())
+                output = report(cve_id, old["diff"], results)
+                print(f"[REPORT] reports/{cve_id}.json")
+                print(f"[REPORT] reports/{cve_id}.txt")
+                print(f"[VERDICT] {output['verdict']}")
             continue
         if args.step == "report":
             prior = ROOT / "reports" / f"{cve_id}.json"

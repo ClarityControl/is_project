@@ -125,7 +125,7 @@ def _read_bindiff(path: Path, affected: str) -> dict:
                 "similarity": round(float(r[4]), 5), "confidence": round(float(r[5]), 5),
                 "flags": r[6], "algorithm_id": r[7]} for r in rows]
     changed = [m for m in matches if m["similarity"] < 0.99999]
-    named = [m for m in matches if m["vulnerable_name"] == affected
+    named = [m for m in matches if affected and m["vulnerable_name"] == affected
              and m["patched_name"] == affected]
     return {"engine": "Ghidra + BinExport + BinDiff", "similarity": round(float(similarity), 5),
             "confidence": round(float(confidence), 5), "function_counts": [r[0] for r in counts],
@@ -133,7 +133,39 @@ def _read_bindiff(path: Path, affected: str) -> dict:
             "affected_function_matches": named, "function_matches": matches}
 
 
-def diff(cve_id: str) -> dict:
+def _export_candidate_decompilations(ghidra: Path, variant: str, binary: Path,
+                                     candidates: list[dict], output: Path) -> None:
+    """Decompile a short BinDiff-ranked candidate list for blind review."""
+    addresses = []
+    key = "vulnerable_address" if variant == "vuln" else "patched_address"
+    for candidate in candidates[:10]:
+        address = candidate.get(key, "")
+        if re.fullmatch(r"0x[0-9a-fA-F]+", address):
+            addresses.append(address)
+    if not addresses:
+        output.write_text('{"functions": []}\n')
+        return
+    settings_name = _ghidra_settings_name(ghidra)
+    script_dir = WORK / "scripts" / variant
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script = script_dir / "ExportCandidateEvidence.java"
+    shutil.copy2(ROOT / "tools" / "ghidra_scripts" / "ExportCandidateEvidence.java", script)
+    project_dir = ROOT / "nday_work" / "ghidra_projects"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    project_name = f"NDay_candidates_{variant}_{os.getpid()}"
+    env = os.environ.copy()
+    env["XDG_CONFIG_HOME"] = str(WORK / "ghidra_config")
+    command = [str(ghidra / "support" / "analyzeHeadless"), str(project_dir), project_name,
+               "-import", str(binary), "-scriptPath", str(script_dir),
+               "-postScript", script.name, str(output), *addresses,
+               "-deleteProject"]
+    proc = subprocess.run(command, check=False, capture_output=True, text=True, env=env, timeout=900)
+    if proc.returncode or not output.is_file() or output.stat().st_size == 0:
+        detail = (proc.stdout + "\n" + proc.stderr)[-5000:]
+        raise RuntimeError(f"Ghidra candidate decompilation failed for {variant}:\n{detail}")
+
+
+def diff(cve_id: str, include_candidate_decomp: bool = False) -> dict:
     target = ROOT / "targets" / cve_id
     meta = json.loads((target / "meta.json").read_text())
     if not meta.get("patched_ref"):
@@ -154,7 +186,8 @@ def diff(cve_id: str) -> dict:
         export = artifact_dir / f"{variant}.BinExport"
         evidence = artifact_dir / f"{variant}_function.json"
         _extract_binary(image, variant, source, extracted)
-        _export_binexport(ghidra, variant, extracted, export, evidence, meta["function"])
+        _export_binexport(ghidra, variant, extracted, export, evidence,
+                          meta.get("function") or "__no_known_affected_function__")
         exported[variant] = export
 
     db = _run_bindiff(bindiff, exported["vuln"], exported["patched"], artifact_dir)
@@ -165,6 +198,13 @@ def diff(cve_id: str) -> dict:
                            and m["vulnerable_name"] and m["patched_name"]
                            and not m["vulnerable_name"].startswith("UndefinedFunction_")
                            and not m["patched_name"].startswith("UndefinedFunction_")]
+    candidate_evidence_files = []
+    if include_candidate_decomp:
+        for variant in ("vuln", "patched"):
+            evidence_path = artifact_dir / f"{variant}_changed_functions.json"
+            _export_candidate_decompilations(ghidra, variant, artifact_dir / f"{variant}.elf",
+                                             reviewed_candidates, evidence_path)
+            candidate_evidence_files.append(str(evidence_path.relative_to(ROOT)))
     changed_names = sorted({name for item in reviewed_candidates
                             for name in (item["vulnerable_name"], item["patched_name"])
                             if name and not name.startswith("UndefinedFunction_")})
@@ -180,7 +220,7 @@ def diff(cve_id: str) -> dict:
                f"(overall similarity {data['similarity']:.3f}, confidence {data['confidence']:.3f}); "
                f"{len(candidates)} lower-similarity matches, of which {len(reviewed_candidates)} "
                f"have confidence >= 0.60 and recovered names. "
-               f"Affected-function matches: {len(affected)} ({meta['function']}).")
+               f"Affected-function matches: {len(affected)} ({meta.get('function') or 'unspecified'}).")
     data.update({"changed_functions": changed_names,
                  "changed_function_matches": reviewed_candidates[:100],
                  "changed_match_count": len(candidates),
@@ -190,6 +230,7 @@ def diff(cve_id: str) -> dict:
                  "binexport_files": [str(p.relative_to(ROOT)) for p in exported.values()],
                  "function_evidence_files": [str((artifact_dir / f"{v}_function.json").relative_to(ROOT))
                                              for v in ("vuln", "patched")],
+                 "candidate_function_evidence_files": candidate_evidence_files,
                  "diff_summary": summary})
     # The standalone .BinDiff artifact retains the full match graph. Keep reports
     # compact by including candidate matches and the CVE function, not every match.
