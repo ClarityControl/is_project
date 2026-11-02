@@ -35,59 +35,62 @@ def get_source_comparison(cve_id: str) -> dict:
         ]
     location = meta.get("root_cause", {}).get("source_location", "")
     relative_path = meta.get("source_path") or location.split(":", 1)[0]
-    source_path = Path(relative_path)
-    if (not relative_path or source_path.is_absolute() or ".." in source_path.parts
-            or "\\" in relative_path):
-        raise RuntimeError(f"Target has no safe source path configured: {relative_path!r}")
+    relative_paths = meta.get("source_paths") or [relative_path]
+    safe_paths = []
+    for item in relative_paths:
+        source_path = Path(item)
+        if (not item or source_path.is_absolute() or ".." in source_path.parts
+                or "\\" in item):
+            raise RuntimeError(f"Target has no safe source path configured: {item!r}")
+        safe_paths.append(item)
 
     artifact_dir = ARTIFACTS / cve_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    source_lines = {}
-    for variant in ("vuln", "patched"):
-        image = f"ndaynexus-{cve_id.lower()}-{variant}"
-        container = f"ndaynexus-source-{variant}-{uuid.uuid4().hex[:12]}"
-        destination = artifact_dir / f"{variant}_{source_path.name}.source"
-        try:
-            subprocess.run(["docker", "create", "--name", container, image], check=True,
-                           capture_output=True, text=True, timeout=30)
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(
-                f"Docker could not create a temporary container from image {image}: {detail}"
-            ) from exc
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"Docker create failed for image {image}: {exc}") from exc
-        try:
-            subprocess.run(["docker", "cp", f"{container}:/build/{source_path.as_posix()}",
-                            str(destination)], check=True, capture_output=True, text=True,
-                           timeout=30)
-            source_lines[variant] = destination.read_text(errors="replace").splitlines(keepends=True)
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(
-                f"Docker created the {variant} container, but could not copy /build/{source_path.as_posix()} "
-                f"from image {image}: {detail}"
-            ) from exc
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"Could not extract {relative_path} from {image}: {exc}") from exc
-        finally:
+    diff_parts = []
+    changed_files = []
+    additions = deletions = 0
+    for relative_path in safe_paths:
+        source_path = Path(relative_path)
+        source_lines = {}
+        for variant in ("vuln", "patched"):
+            image = f"ndaynexus-{cve_id.lower()}-{variant}"
+            container = f"ndaynexus-source-{variant}-{uuid.uuid4().hex[:12]}"
+            destination = artifact_dir / f"{variant}_{source_path.name}.source"
             try:
-                subprocess.run(["docker", "rm", "-f", container], check=False,
+                subprocess.run(["docker", "create", "--name", container, image], check=True,
                                capture_output=True, text=True, timeout=30)
-            except (OSError, subprocess.SubprocessError):
-                pass
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip()
+                raise RuntimeError(f"Docker could not create a temporary container from image {image}: {detail}") from exc
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(f"Docker create failed for image {image}: {exc}") from exc
+            try:
+                subprocess.run(["docker", "cp", f"{container}:/build/{source_path.as_posix()}",
+                                str(destination)], check=True, capture_output=True, text=True, timeout=30)
+                source_lines[variant] = destination.read_text(errors="replace").splitlines(keepends=True)
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip()
+                raise RuntimeError(f"Could not extract /build/{relative_path} from {image}: {detail}") from exc
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(f"Could not extract {relative_path} from {image}: {exc}") from exc
+            finally:
+                try:
+                    subprocess.run(["docker", "rm", "-f", container], check=False,
+                                   capture_output=True, text=True, timeout=30)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        file_diff = list(difflib.unified_diff(
+            source_lines["vuln"], source_lines["patched"],
+            fromfile=f"vulnerable/{relative_path}", tofile=f"patched/{relative_path}", n=5))
+        if file_diff:
+            changed_files.append(relative_path)
+            additions += sum(1 for line in file_diff if line.startswith("+") and not line.startswith("+++"))
+            deletions += sum(1 for line in file_diff if line.startswith("-") and not line.startswith("---"))
+            diff_parts.extend(file_diff)
+    if not diff_parts:
+        raise RuntimeError(f"No source changes found in configured files: {', '.join(safe_paths)}")
 
-    diff_lines = list(difflib.unified_diff(
-        source_lines["vuln"], source_lines["patched"],
-        fromfile=f"vulnerable/{relative_path}",
-        tofile=f"patched/{relative_path}",
-        n=5,
-    ))
-    if not diff_lines:
-        raise RuntimeError(f"No source changes found in {relative_path}.")
-
-    additions = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
-    deletions = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+    diff_lines = diff_parts
     diff_text = "".join(diff_lines)
     display_truncated = len(diff_text) > 20000
     if display_truncated:
@@ -113,6 +116,7 @@ def get_source_comparison(cve_id: str) -> dict:
         "display_truncated": display_truncated,
         "diff_path": diff_file,
         "source_path": relative_path,
+        "source_paths": changed_files,
         "function": location.split(":", 1)[1] if ":" in location else meta.get("function", ""),
         "additions": additions,
         "deletions": deletions,

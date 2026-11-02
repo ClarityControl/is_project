@@ -1,0 +1,11 @@
+corpus/*
+!corpus/tiny.png
+!corpus/tiny.bmp
+!corpus/tiny.tga
+!corpus/tiny.gif
+!corpus/known_public_gif_regression.gif
+!corpus/zlib_header.zlib
+!corpus/zlib_raw.deflate
+artifacts/*
+upstream_seeds/
+zlib_corpus/

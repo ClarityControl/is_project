@@ -17,10 +17,16 @@ Source-level root-cause evidence:
 {% if meta.root_cause.target_build_buffer_storage is defined %}- Classification note: advisory says {{ meta.root_cause.advisory_classification }}; {{ meta.root_cause.target_build_buffer_storage }} The ASan report labels the observed write {{ meta.root_cause.sanitizer_observed_classification }}.
 {% endif %}- Upstream version diff: {{ meta.root_cause.source_diff }}
 
-3. Binary diff summary
+3. Patch comparison summary
 {{ diff.diff_summary }}
 
-Diff artifact: {{ diff.diff_binary_path }}
+{% if diff.analysis_method == 'source_and_symbols' %}Source files changed: {{ diff.source_comparison.source_paths | join(', ') }}
+Source patch artifact: {{ diff.source_comparison.artifact }} ({{ diff.source_comparison.additions }} additions, {{ diff.source_comparison.deletions }} deletions)
+Symbol table artifact: {{ diff.symbol_comparison.artifact }}
+Focused PHP symbols:
+{% for symbol in diff.symbol_comparison.focus_symbols %}- {{ symbol.name }}: {{ symbol.status }}{% if symbol.vulnerable %}; vulnerable address {{ symbol.vulnerable.address }}{% endif %}{% if symbol.patched %}; patched address {{ symbol.patched.address }}{% endif %}
+{% endfor %}The source diff presents the implementation change. Symbol presence and addresses provide compiled-binary context.
+{% else %}Diff artifact: {{ diff.diff_binary_path }}
 BinExport inputs: {{ diff.binexport_files | join(', ') }}
 Ghidra function evidence files: {{ diff.function_evidence_files | join(', ') }}
 Ghidra function metrics (these frame sizes do not identify the vulnerable buffer's storage location):
@@ -33,20 +39,39 @@ Affected-function matches in BinDiff:
 {% if diff.changed_function_matches %}{% for match in diff.changed_function_matches[:12] %}- {{ match.vulnerable_name }} -> {{ match.patched_name }}; similarity {{ match.similarity }}, confidence {{ match.confidence }}
 {% endfor %}{% else %}- No matched functions had a lower similarity score; inspect the BinDiff database for unmatched/renamed functions.
 {% endif %}
+{% endif %}
 
-4. Probe verification (local container runtime evidence; not a control-flow hijack demonstration)
+4. Probe verification (local container runtime evidence)
+{% if meta.get('probe', {}).get('mode') == 'crypto' %}Vulnerable crypto-behavior result: {{ results.vuln.crypto_weakness_rate | default(0) }} ({{ results.vuln.results | join(', ') }})
+Patched distinct-IV result: {{ results.patched.crypto_distinct_rate | default(0) }} ({{ results.patched.results | join(', ') }})
+The probe encrypts fixed local plaintext twice with the same key and two different 16-byte IVs that differ only in the final byte. Matching ciphertext and tags on the vulnerable build demonstrate that this API call path failed to distinguish the requested IV inputs. This is a local behavior demonstration, not recovered plaintext or evidence that TLS is affected.
+{% elif meta.get('probe', {}).get('mode') == 'rce' %}Vulnerable command-execution rate: {{ results.vuln.rce_rate }} ({{ results.vuln.results | join(', ') }})
+Patched no-command-execution rate: {{ results.patched.no_rce_rate }} ({{ results.patched.results | join(', ') }})
+{% else %}
 Vulnerable crash rate: {{ results.vuln.crash_rate }} ({{ results.vuln.results | join(', ') }})
 Patched clean rate: {{ results.patched.clean_rate }} ({{ results.patched.results | join(', ') }})
+{% endif %}
 {% for variant in ['vuln', 'patched'] %}{{ variant | capitalize }} probe observations:
 {% if results[variant].trials is defined %}{% for trial in results[variant].trials %}- {{ trial.outcome }}; payload {{ trial.payload_bytes | default('unknown') }} bytes{% if trial.signal is defined and trial.signal %}; terminating signal {{ trial.signal }} (process exit {{ trial.exit_code }}){% elif trial.exit_code is defined %}; process exit {{ trial.exit_code }}{% endif %}
-{% endfor %}{% else %}- Per-trial process telemetry is not present in this report; rerun the probe stage to collect it.
+{% if meta.get('probe', {}).get('mode') == 'crypto' %}  Effective lengths: {{ trial.reported_iv_length_a | default('?') }}, {{ trial.reported_iv_length_b | default('?') }}; same ciphertext/tag for same message: {{ trial.same_ciphertext_and_tag | default('unknown') }}; ciphertext-XOR matches plaintext-XOR: {{ trial.plaintext_xor_matches_ciphertext_xor | default('unknown') }}
+{% elif meta.get('probe', {}).get('mode') == 'rce' %}  Command reached target: {{ trial.fired | default(false) }}{% if trial.output %}; output: {{ trial.output | replace('\n', ' ') | truncate(320) }}{% endif %}
+{% endif %}{% endfor %}{% else %}- Per-trial process telemetry is not present in this report; rerun the probe stage to collect it.
 {% endif %}{% endfor %}
 
+{% if meta.get('probe', {}).get('mode') == 'crypto' %}Cryptographic behavior evidence:
+{% for variant in ['vuln', 'patched'] %}- {{ variant }}: {{ results[variant].impact.outcome | default('NOT RUN') }}{% if results[variant].impact.same_ciphertext_and_tag is defined %}; same ciphertext and tag={{ results[variant].impact.same_ciphertext_and_tag }}; requested IV length={{ results[variant].impact.requested_iv_length }}; reported lengths={{ results[variant].impact.reported_iv_length_a }}/{{ results[variant].impact.reported_iv_length_b }}{% endif %}
+{% endfor %}Interpretation: the vulnerable harness demonstrates IV collapse and the resulting two-time-pad relationship between two known demo messages. It does not recover a real secret and does not imply OpenSSL TLS is vulnerable.
+{% elif meta.get('probe', {}).get('mode') == 'rce' %}Benign command-execution impact validation:
+{% for variant in ['vuln', 'patched'] %}- {{ variant }}: {{ results[variant].impact.outcome | default('NOT RUN') }}; fired={{ results[variant].impact.fired | default(false) }}{% if results[variant].impact.output %}; output: {{ results[variant].impact.output | replace('\n', ' ') | truncate(500) }}{% endif %}{% if results[variant].impact.error is defined %}; {{ results[variant].impact.error }}{% endif %}
+{% endfor %}
+{% else %}
 AddressSanitizer impact validation:
 {% for variant in ['vuln', 'patched'] %}- {{ variant }}: {{ results[variant].impact.outcome | default('NOT RUN') }}{% if results[variant].impact.diagnostic is defined %}; {{ results[variant].impact.diagnostic }}{% endif %}{% if results[variant].impact.error is defined %}; {{ results[variant].impact.error }}{% endif %}
 {% for line in results[variant].impact.evidence_excerpt | default([]) %}  {{ line }}
-{% endfor %}
-{% endfor %}
+{% endfor %}{% endfor %}
+{% endif %}
+{% if meta.root_cause.additional_changed_files is defined %}Upstream fix also changes: {{ meta.root_cause.additional_changed_files | join(', ') }}
+{% endif %}
 
 {% if llm_explanation %}5. Model-generated explanation (hypothesis; human review required)
 Model: {{ llm_explanation.model }} · generated {{ llm_explanation.generated_at }}

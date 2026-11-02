@@ -8,6 +8,7 @@ from modules.builder import build
 from modules.differ import diff
 from modules.runner import run as run_exploit
 from modules.reporter import report
+from modules.report_security import read_json_report
 from modules.ollama_explainer import blind_analyze, explain as explain_with_ollama, list_models
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +29,7 @@ def main():
     for cve_id in ids:
         if cve_id not in target_ids():
             parser.error(f"unknown CVE: {cve_id}")
-        print(f"[N-DAY NEXUS] {cve_id}\n{'─' * 41}")
+        print(f"[N-DAY NEXUS] {cve_id}\n{'─' * 41}", flush=True)
         if args.step in ("explain", "blind"):
             model = args.model
             if not model:
@@ -48,11 +49,11 @@ def main():
             preview = generated.get("hypothesis_text", generated.get("text", "")).replace("\n", " ").strip()
             print(f"[OLLAMA] {preview[:300]}")
             if args.step == "blind":
-                print(f"[ARTIFACT] .work/artifacts/{cve_id}/blind_hypothesis.md")
-                print(f"[ARTIFACT] .work/artifacts/{cve_id}/blind_hypothesis.json")
+                print(f"[ARTIFACT] .work/artifacts/{cve_id}/blind_hypothesis.md.enc")
+                print(f"[ARTIFACT] .work/artifacts/{cve_id}/blind_hypothesis.json.enc")
             else:
-                print(f"[REPORT] reports/{cve_id}.json")
-                print(f"[REPORT] reports/{cve_id}.txt")
+                print(f"[REPORT] reports/{cve_id}.json.enc")
+                print(f"[REPORT] reports/{cve_id}.txt.enc")
             continue
         diff_data = None
         results = None
@@ -61,39 +62,53 @@ def main():
             built = build(cve_id)
         if args.step in (None, "diff"):
             diff_data = diff(cve_id)
-            visible = diff_data["changed_functions"]
-            preview = ", ".join(visible[:15]) or "none"
-            more = f" (+{len(visible) - 15} more)" if len(visible) > 15 else ""
-            print(f"[DIFF] Changed-function candidates: {preview}{more}")
+            if diff_data.get("analysis_method") == "source_and_symbols":
+                print(f"[DIFF] {diff_data['diff_summary']}")
+            else:
+                visible = diff_data["changed_functions"]
+                preview = ", ".join(visible[:15]) or "none"
+                more = f" (+{len(visible) - 15} more)" if len(visible) > 15 else ""
+                print(f"[DIFF] Changed-function candidates: {preview}{more}")
         if args.step in (None, "probe", "exploit"):
             results = run_exploit(cve_id)
+            probe_mode = json.loads((ROOT / "targets" / cve_id / "meta.json").read_text()).get("probe", {}).get("mode")
             for variant in ("vuln", "patched"):
                 data = results[variant]
-                summary = (f"CRASHED {data['results'].count('CRASHED')}/5" if variant == "vuln"
-                           else f"{'CLEAN' if data['crash_rate'] <= .2 else 'CRASHED'} {data['results'].count('CLEAN')}/5")
+                if probe_mode == "rce":
+                    label = "RCE_CONFIRMED" if variant == "vuln" else "NO_RCE"
+                    summary = f"{label} {data['results'].count(label)}/5"
+                elif probe_mode == "crypto":
+                    label = ("CRYPTO_WEAKNESS_CONFIRMED" if variant == "vuln"
+                             else "CRYPTO_BEHAVIOR_DISTINCT")
+                    summary = f"{label} {data['results'].count(label)}/5"
+                else:
+                    summary = (f"CRASHED {data['results'].count('CRASHED')}/5" if variant == "vuln"
+                               else f"{'CLEAN' if data['crash_rate'] <= .2 else 'CRASHED'} {data['results'].count('CLEAN')}/5")
                 print(f"[PROBE] {variant}: {summary}")
         if args.step == "build":
             continue
         if args.step == "diff":
             continue
         if args.step in ("probe", "exploit"):
-            prior = ROOT / "reports" / f"{cve_id}.json"
-            if prior.exists():
-                old = json.loads(prior.read_text())
+            prior = ROOT / "reports" / f"{cve_id}.json.enc"
+            legacy_prior = ROOT / "reports" / f"{cve_id}.json"
+            if prior.exists() or legacy_prior.exists():
+                old = read_json_report(cve_id)
                 output = report(cve_id, old["diff"], results)
-                print(f"[REPORT] reports/{cve_id}.json")
-                print(f"[REPORT] reports/{cve_id}.txt")
+                print(f"[REPORT] reports/{cve_id}.json.enc")
+                print(f"[REPORT] reports/{cve_id}.txt.enc")
                 print(f"[VERDICT] {output['verdict']}")
             continue
         if args.step == "report":
-            prior = ROOT / "reports" / f"{cve_id}.json"
-            if not prior.exists():
+            prior = ROOT / "reports" / f"{cve_id}.json.enc"
+            legacy_prior = ROOT / "reports" / f"{cve_id}.json"
+            if not prior.exists() and not legacy_prior.exists():
                 parser.error("run build, diff, and exploit before report")
-            old = json.loads(prior.read_text())
+            old = read_json_report(cve_id)
             diff_data, results = old["diff"], old["results"]
         output = report(cve_id, diff_data, results)
-        print(f"[REPORT] reports/{cve_id}.json")
-        print(f"[REPORT] reports/{cve_id}.txt")
+        print(f"[REPORT] reports/{cve_id}.json.enc")
+        print(f"[REPORT] reports/{cve_id}.txt.enc")
         print(f"[VERDICT] {output['verdict']}")
 
 if __name__ == "__main__":

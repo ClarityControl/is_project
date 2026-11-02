@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
+import queue
 import re
+import signal
 import struct
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,27 +26,83 @@ MARKER = "HELLO WORLD: benign callback reached."
 
 
 def _docker(args: list[str], *, input_bytes: bytes | None = None,
-            timeout: int = 600) -> subprocess.CompletedProcess:
+            timeout: int = 600, progress=None) -> subprocess.CompletedProcess:
+    command = ["docker", *args]
     try:
-        result = subprocess.run(
-            ["docker", *args], input=input_bytes, capture_output=True,
-            text=input_bytes is None, timeout=timeout, check=False,
-        )
+        if progress and input_bytes is None:
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True,
+            )
+            output_queue = queue.Queue()
+
+            def collect_output():
+                try:
+                    for line in process.stdout:
+                        output_queue.put(line)
+                finally:
+                    output_queue.put(None)
+
+            reader = threading.Thread(target=collect_output, daemon=True)
+            reader.start()
+            output = []
+            deadline = time.monotonic() + timeout
+            reader_finished = False
+            while not (reader_finished and process.poll() is not None):
+                if time.monotonic() >= deadline:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=5)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                    reader.join(timeout=2)
+                    raise RuntimeError(
+                        f"Docker build exceeded {timeout} seconds. Last output:\n"
+                        + "".join(output[-40:])
+                    )
+                try:
+                    line = output_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    reader_finished = True
+                    continue
+                output.append(line)
+                progress(line.strip()[-140:] or "Docker build is running…")
+            reader.join(timeout=2)
+            result = subprocess.CompletedProcess(command, process.returncode,
+                                                  stdout="".join(output), stderr="")
+        else:
+            result = subprocess.run(
+                command, input=input_bytes, capture_output=True,
+                text=input_bytes is None, timeout=timeout, check=False,
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"Docker command failed: {exc}") from exc
     if result.returncode:
         stderr = result.stderr
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", errors="replace")
-        raise RuntimeError(f"Docker command exited {result.returncode}: {stderr.strip()}")
+        detail = stderr or result.stdout or "no output"
+        raise RuntimeError(f"Docker command exited {result.returncode}: {detail.strip()[-6000:]}")
     return result
 
 
-def _build_images() -> None:
+def _build_images(progress=None) -> None:
     for variant, image in IMAGES.items():
         dockerfile_variant = "vuln" if variant == "vulnerable" else variant
         dockerfile = LAB / dockerfile_variant / "Dockerfile"
-        _docker(["build", "--tag", image, "--file", str(dockerfile), str(LAB)])
+        if progress:
+            progress(f"Building {variant} control-flow lab image (maximum 10 minutes)…")
+        _docker(["build", "--progress=plain", "--tag", image,
+                 "--file", str(dockerfile), str(LAB)], timeout=600,
+                progress=progress)
+        if progress:
+            progress(f"{variant.capitalize()} lab image is ready; continuing…")
 
 
 def _run(image: str, payload: bytes | None = None, *, info: bool = False) -> str:
@@ -60,12 +121,14 @@ def _run(image: str, payload: bytes | None = None, *, info: bool = False) -> str
     return output
 
 
-def run_control_flow_demo() -> dict:
+def run_control_flow_demo(progress=None) -> dict:
     """Build both lab variants, run the fixed benign redirect, and save evidence."""
     if platform.machine().lower() not in {"x86_64", "amd64"} or struct.calcsize("P") != 8:
         raise RuntimeError("This teaching demo currently requires a 64-bit x86 host.")
 
-    _build_images()
+    _build_images(progress)
+    if progress:
+        progress("Reading the benign callback address from the isolated image…")
     info = _run(IMAGES["vulnerable"], info=True)
     address_match = re.search(r"^TARGET_ADDR=0x([0-9a-fA-F]+)$", info, re.MULTILINE)
     offset_match = re.search(r"^CALLBACK_OFFSET=(\d+)$", info, re.MULTILINE)
@@ -78,7 +141,11 @@ def run_control_flow_demo() -> dict:
         raise RuntimeError("Lab layout differs from the expected fixed demo layout.")
     payload = b"A" * callback_offset + struct.pack("<Q", callback_address)
 
+    if progress:
+        progress("Running the vulnerable lab input…")
     vulnerable_output = _run(IMAGES["vulnerable"], payload)
+    if progress:
+        progress("Running the same input against the patched lab…")
     patched_output = _run(IMAGES["patched"], payload)
     vulnerable_redirected = MARKER in vulnerable_output
     patched_rejected = "rejected oversized input" in patched_output.lower()
